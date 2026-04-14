@@ -427,3 +427,17 @@ def test_per_head_quant_scales_backend_selection(
                     use_per_head_quant_scales=True,
                 )
             assert backend_name in str(exc_info.value)
+
+
+def test_flex_attention_rejects_small_block_sizes():
+    """FlexAttention's Triton kernel requires block tiles >= 16. Block sizes
+    below that used to slip through backend selection and crash during Triton
+    codegen (issue #39340); ensure they are now rejected up front, matching
+    the other Triton-based backends."""
+    from vllm.v1.attention.backends.flex_attention import FlexAttentionBackend
+
+    assert not FlexAttentionBackend.supports_block_size(1)
+    assert not FlexAttentionBackend.supports_block_size(8)
+    assert FlexAttentionBackend.supports_block_size(16)
+    assert FlexAttentionBackend.supports_block_size(32)
+    assert FlexAttentionBackend.supports_block_size(64)

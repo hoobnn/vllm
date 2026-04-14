@@ -35,6 +35,7 @@ from vllm.v1.attention.backend import (
     AttentionMetadataBuilder,
     AttentionType,
     CommonAttentionMetadata,
+    MultipleOf,
 )
 from vllm.v1.kv_cache_interface import AttentionSpec
 
@@ -85,6 +86,14 @@ class FlexAttentionBackend(AttentionBackend):
     ]
 
     forward_includes_kv_cache_update: bool = False
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        # The FlexAttention Triton kernel requires BLOCK tiles of at least
+        # 16. Smaller block sizes silently reach torch.compile and crash
+        # during Triton codegen, so reject them at backend selection time
+        # (matching FlashAttention / TritonAttention / FlashInfer behavior).
+        return [MultipleOf(16)]
 
     @staticmethod
     def get_name() -> str:
@@ -1140,13 +1149,13 @@ def get_kernel_options(
         kernel_options["BLOCK_N"] = 16
         kernel_options["IS_DIVISIBLE"] = False
         return kernel_options
+    block_lower_bound = 16
     if use_direct_build:
-        kernel_options["BLOCK_M"] = block_m
-        kernel_options["BLOCK_N"] = block_n
+        kernel_options["BLOCK_M"] = max(block_m, block_lower_bound)
+        kernel_options["BLOCK_N"] = max(block_n, block_lower_bound)
         return kernel_options
     else:
         preferred_block = 32 if query.dtype == torch.float32 else 64
-        block_lower_bound = 16
 
         block_m_candidate = ensure_divisible(preferred_block, block_m)
         block_n_candidate = ensure_divisible(preferred_block, block_n)
