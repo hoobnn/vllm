@@ -6,6 +6,7 @@ from itertools import islice
 import torch
 from torch import nn
 
+from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
     CacheConfig,
     VllmConfig,
@@ -46,6 +47,9 @@ from vllm.model_executor.model_loader.weight_utils import (
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 from vllm.v1.attention.backend import AttentionType
+from vllm.v1.attention.backends.flash_attn_diffkv import (
+    FlashAttentionDiffKVBackend,
+)
 
 from .interfaces import MixtureOfExperts, SupportsPP
 from .utils import (
@@ -265,7 +269,7 @@ class MiMoV2Attention(nn.Module):
             self.total_num_heads * self.v_head_dim,
             hidden_size,
             bias=False,
-            quant_config=quant_config,
+            quant_config=quant_config if "mtp.layers" not in prefix else None,
             reduce_results=True,
             prefix=f"{prefix}.o_proj",
         )
@@ -287,6 +291,15 @@ class MiMoV2Attention(nn.Module):
         )
 
         sliding_window = sliding_window_size if sliding_window_size > -1 else None
+
+        # Use DiffKV backend when V has a different head dim than K
+        if self.v_head_dim != self.head_dim:
+            FlashAttentionDiffKVBackend.set_head_size_v(self.v_head_dim)
+            attn_backend = FlashAttentionDiffKVBackend
+            logger.info_once("Using FlashAttentionDiffKVBackend for attention.")
+        else:
+            attn_backend = None
+
         self.attn = Attention(
             self.num_heads,
             self.head_dim,
@@ -298,6 +311,8 @@ class MiMoV2Attention(nn.Module):
             attn_type=AttentionType.DECODER,
             prefix=f"{prefix}.attn",
             sinks=self.attention_sink_bias,
+            attn_backend=attn_backend,
+            head_size_v=self.v_head_dim,
         )
 
     def forward(
@@ -313,15 +328,7 @@ class MiMoV2Attention(nn.Module):
         if self.v_scale is not None:
             v = v * self.v_scale
 
-        v = v.view(-1, self.num_kv_heads, self.v_head_dim)
-        v = torch.nn.functional.pad(v, [0, self.head_dim - self.v_head_dim], value=0)
-        v = v.view(-1, self.num_kv_heads * self.head_dim)
-
         attn_output = self.attn(q, k, v)
-
-        attn_output = attn_output.view(-1, self.num_heads, self.head_dim)[
-            ..., : self.v_head_dim
-        ].reshape(-1, self.num_heads * self.v_head_dim)
 
         output, _ = self.o_proj(attn_output)
         return output
@@ -434,6 +441,7 @@ class MiMoV2FlashDecoderLayer(nn.Module):
         return self.config.hybrid_layer_pattern[self.layer_id] == 1
 
 
+@support_torch_compile
 class MiMoV2Model(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
@@ -597,7 +605,13 @@ class MiMoV2Model(nn.Module):
 
             if expert_matched:
                 continue
-
+            # Support fused qkv_proj checkpoint (Pro format)
+            if "qkv_proj" in name:
+                if name in params_dict:
+                    param = params_dict[name]
+                    loaded_weight = loaded_weight.chunk(tp_size, dim=0)[tp_rank]
+                    default_weight_loader(param, loaded_weight)
+                continue
             stacked_matched = False
             for param_name, weight_name, shard_id in stacked_params_mapping:
                 if weight_name not in name:
@@ -656,6 +670,11 @@ class MiMoV2Model(nn.Module):
 
 
 class MiMoV2FlashForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
+    packed_modules_mapping = {
+        "qkv_proj": ["q_proj", "k_proj", "v_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         config = vllm_config.model_config.hf_config
@@ -712,3 +731,10 @@ class MiMoV2FlashForCausalLM(nn.Module, SupportsPP, MixtureOfExperts):
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)
+
+
+class MiMoV2ProForCausalLM(MiMoV2FlashForCausalLM):
+    packed_modules_mapping = {
+        "qkv_proj": ["qkv_proj"],
+        "gate_up_proj": ["gate_proj", "up_proj"],
+    }
